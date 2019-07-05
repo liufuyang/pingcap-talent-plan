@@ -13,7 +13,6 @@ fn main() {
         .setting(AppSettings::SubcommandRequiredElseHelp)
         .get_matches();
 
-
     match matches.subcommand() {
         ("set", Some(_matches)) => {
             eprintln!("unimplemented");

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
+/// The struct to hold key value pairs.
+/// Currently it uses memory storage.
 pub struct KvStore {
-    store: HashMap<String, String>
+    store: HashMap<String, String>,
 }
 
 /// A store that keeps key-value pairs in memory
@@ -16,11 +18,10 @@ pub struct KvStore {
 /// assert_eq!(store.get("key1".to_owned()), None);
 /// ```
 impl KvStore {
-
     /// Creat a key value store
     pub fn new() -> KvStore {
         KvStore {
-            store: HashMap::new()
+            store: HashMap::new(),
         }
     }
 
