@@ -1,1 +1,0 @@
-initSidebarItems({"struct":[["KvStore","The struct to hold key value pairs. Currently it uses memory storage."]]});

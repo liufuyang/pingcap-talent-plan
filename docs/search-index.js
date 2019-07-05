@@ -1,5 +1,0 @@
-var N=null,E="",T="t",U="u",searchIndex={};
-var R=["string","result","KvStore"];
-
-searchIndex["kvs"]={"doc":"A key value store that can store string key and string…","i":[[3,R[2],"kvs","The struct to hold key value pairs. Currently it uses…",N,N],[11,"new",E,"Creat a key value store",0,[[],["kvstore"]]],[11,"set",E,"Set key value to store",0,[[["self"],[R[0]]]]],[11,"get",E,"Get value by a key from store",0,[[["self"],[R[0]]],[[R[0]],["option",[R[0]]]]]],[11,"remove",E,"Remove key value from store",0,[[["self"],[R[0]]]]],[11,"into",E,E,0,[[],[U]]],[11,"from",E,E,0,[[[T]],[T]]],[11,"try_from",E,E,0,[[[U]],[R[1]]]],[11,"try_into",E,E,0,[[],[R[1]]]],[11,"borrow_mut",E,E,0,[[["self"]],[T]]],[11,"borrow",E,E,0,[[["self"]],[T]]],[11,"type_id",E,E,0,[[["self"]],["typeid"]]]],"p":[[3,R[2]]]};
-initSearch(searchIndex);addSearchOptions(searchIndex);
