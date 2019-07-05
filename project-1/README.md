@@ -1,0 +1,1 @@
+https://github.com/pingcap/talent-plan/blob/master/rust/docs/lesson-plan.md
