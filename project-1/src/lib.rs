@@ -1,3 +1,4 @@
+#![doc(html_root_url = "https://liufuyang.github.io/pingcap-talent-plan/")]
 #![deny(missing_docs)]
 
 //! A key value store that can store string key
