@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io;
-use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::io::Read;
+use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,10 +15,9 @@ type R<T> = Result<T>;
 /// The struct to hold key value pairs.
 /// Currently it uses memory storage.
 pub struct KvStore {
-
     map: BTreeMap<String, (usize, usize)>,
 
-    writer: FileWriteBuf<File>,
+    writer: CursorBufWriter<File>,
     reader: BufReader<File>,
 }
 
@@ -48,7 +47,7 @@ impl KvStore {
     /// (rm k1) - (66, 89)
     /// (set k3, v3) - (89, 122)
     ///
-    /// KvStore has a writer: FileWriteBuf, which has a filed `pos` is used for keep track of the
+    /// KvStore has a writer: CursorBufWriter, which has a filed `pos` is used for keep track of the
     /// current position/cursor of the end of the file.
     ///
     /// After loading the above example, `writer.pos` will be set as 122.
@@ -61,7 +60,7 @@ impl KvStore {
         let file_path = path.join("kvs.store");
 
         // create file if not exist, by creating a writer
-        let mut writer = FileWriteBuf::new(
+        let mut writer = CursorBufWriter::new(
             OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -71,33 +70,28 @@ impl KvStore {
         let reader = BufReader::new(OpenOptions::new().read(true).open(&file_path)?);
 
         // open the file again for reading to load data on open
-        let file = OpenOptions::new().read(true).open(&file_path)?;
+        let file = BufReader::new(OpenOptions::new().read(true).open(&file_path)?);
         let mut map = BTreeMap::new();
-        let file = BufReader::new(file);
-        // https://docs.serde.rs/serde_json/de/struct.StreamDeserializer.html
-        let mut stream = Deserializer::from_reader(file).into_iter::<Command>();
+        let mut stream = Deserializer::from_reader(file).into_iter::<Command>(); // https://docs.serde.rs/serde_json/de/struct.StreamDeserializer.html
+
         let mut pos_start: usize = 0;
         let mut pos_end: usize = 0;
+
         while let Some(command) = stream.next() {
             pos_end = stream.byte_offset();
 
             if let Ok(command) = command {
                 match command {
                     Command::Set { key, value } => {
-                        // TODO - remove print
-//                        println!("(set {}, {}) - ({}, {})", key, value, pos_start, pos_end);
                         map.insert(key, (pos_start, pos_end));
                     }
                     Command::Remove { key } => {
-                        // TODO - remove print
-//                        println!("(rm {}) - ({}, {})", key, pos_start, pos_end);
                         map.remove(key.as_str());
                     }
                 }
             }
             pos_start = pos_end;
         }
-        writer.pos = pos_end as u64;
         // finish loading
 
         Ok(KvStore {
@@ -117,7 +111,8 @@ impl KvStore {
 
         match command {
             Command::Set { key, value } => {
-                self.map.insert(key, (pos_current as usize, self.writer.pos as usize));
+                self.map
+                    .insert(key, (pos_current as usize, self.writer.pos as usize));
             }
             _ => unreachable!(),
         }
@@ -129,15 +124,12 @@ impl KvStore {
     pub fn get(&mut self, key: String) -> R<Option<String>> {
         let (pos_1, pos_2) = match self.map.get(&key) {
             Some((pos_1, pos_2)) => (*pos_1, *pos_2),
-            None => return Ok(None)
+            None => return Ok(None),
         };
 
         self.reader.seek(SeekFrom::Start(pos_1 as u64))?;
-//        println!("get - p1: {}", pos_1);
-//        println!("get - p2 - p1: {}", pos_2 - pos_1);
-        let mut buf = vec![0u8; pos_2 - pos_1];  // https://stackoverflow.com/questions/30412521/how-to-read-a-specific-number-of-bytes-from-a-stream
+        let mut buf = vec![0u8; pos_2 - pos_1]; // https://stackoverflow.com/questions/30412521/how-to-read-a-specific-number-of-bytes-from-a-stream
         self.reader.read_exact(&mut buf)?;
-//        println!("get - buf: {}", String::from_utf8(buf.clone()).unwrap());
         let command: Command = serde_json::from_slice(&buf)?;
 
         match command {
@@ -188,29 +180,28 @@ impl Command {
     }
 }
 
-struct FileWriteBuf<W: Write + Seek> {
+/// A cursor like BufWriter
+struct CursorBufWriter<W: Write + Seek> {
     writer: BufWriter<W>,
     pos: u64, // keep current file end position
 }
 
-impl<W: Write + Seek> FileWriteBuf<W> {
+impl<W: Write + Seek> CursorBufWriter<W> {
     fn new(mut inner: W) -> Result<Self> {
-        let pos = inner.seek(SeekFrom::Current(0))?;
-        // TODO
-        // println!("new pos: {}", pos);
-        Ok(FileWriteBuf {
+        let pos = inner.seek(SeekFrom::End(0))?; // keep pos at the end of file. Otherwise do `writer.pos = pos_end as u64;` in function open()
+
+        Ok(CursorBufWriter {
             writer: BufWriter::new(inner),
             pos,
         })
     }
 }
 
-impl<W: Write + Seek> Write for FileWriteBuf<W> {
+impl<W: Write + Seek> Write for CursorBufWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let offset = self.writer.write(buf)?;
         self.pos += offset as u64;
-        // TODO
-//        println!("pos after write: {}", self.pos);
+
         Ok(offset)
     }
 
@@ -219,7 +210,7 @@ impl<W: Write + Seek> Write for FileWriteBuf<W> {
     }
 }
 
-impl<W: Write + Seek> Seek for FileWriteBuf<W> {
+impl<W: Write + Seek> Seek for CursorBufWriter<W> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         self.pos = self.writer.seek(pos)?;
         Ok(self.pos)
