@@ -9,8 +9,9 @@
 //! This is a homework project made with the
 //! [PingCAP training program](https://github.com/pingcap/talent-plan)
 
-pub use store::KvStore;
+pub use error::KvsError;
 pub use error::Result;
+pub use store::KvStore;
 
-mod store;
 mod error;
+mod store;

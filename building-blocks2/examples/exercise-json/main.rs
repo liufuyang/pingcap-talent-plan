@@ -1,7 +1,7 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 use std::fs::File;
-use std::io::{Cursor};
+use std::io::Cursor;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Move {
@@ -37,13 +37,14 @@ fn main() {
     let deserialized: Move = serde_json::from_reader(&buffer[..]).unwrap();
     println!("deserialized from String = {:?}", deserialized);
 
-
     // RSON
     let serialized = ron::ser::to_string(&point).unwrap().into_bytes();
-    println!("serialized RSON buffer String = {:?}", String::from_utf8(serialized.clone()).unwrap());
+    println!(
+        "serialized RSON buffer String = {:?}",
+        String::from_utf8(serialized.clone()).unwrap()
+    );
     let deserialized: Move = ron::de::from_reader(&serialized[..]).unwrap();
     println!("deserialized from RSON String = {:?}", deserialized);
-
 
     // BSON
     let mut file = File::create("test.bson").unwrap();
@@ -68,7 +69,6 @@ fn main() {
     let doc = bson::decode_document(&mut file).unwrap();
     let deserialized: Move = bson::from_bson(bson::Bson::Document(doc)).unwrap();
     println!("deserialized from BSON file = {:?}", deserialized);
-
 
     // BSON Vec
     let mut file = Vec::new();
