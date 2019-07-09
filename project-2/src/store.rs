@@ -209,10 +209,10 @@ impl<W: Write + Seek> Write for CursorBufWriter<W> {
         self.writer.flush()
     }
 }
-
-impl<W: Write + Seek> Seek for CursorBufWriter<W> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.pos = self.writer.seek(pos)?;
-        Ok(self.pos)
-    }
-}
+//
+//impl<W: Write + Seek> Seek for CursorBufWriter<W> {
+//    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+//        self.pos = self.writer.seek(pos)?;
+//        Ok(self.pos)
+//    }
+//}
