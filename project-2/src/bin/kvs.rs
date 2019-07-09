@@ -27,7 +27,7 @@ fn main() -> Result<()> {
         }
         ("get", Some(matches)) => {
             let key = matches.value_of("KEY").expect("KEY argument missing");
-            let store = KvStore::open("./")?;
+            let mut store = KvStore::open("./")?;
 
             match store.get(key.to_owned())? {
                 Some(value) => println!("{}", value),

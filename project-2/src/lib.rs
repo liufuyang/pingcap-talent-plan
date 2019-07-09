@@ -1,5 +1,6 @@
 #![doc(html_root_url = "https://liufuyang.github.io/pingcap-talent-plan/")]
 #![deny(missing_docs)]
+#![feature(bufreader_seek_relative)]
 
 //! A key value store that can store string key
 //! and string values onto disk.
