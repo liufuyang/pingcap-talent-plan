@@ -25,14 +25,14 @@ pub struct KvStore {
     writer: CursorBufWriter<File>,
     readers: HashMap<usize, BufReader<File>>,
 
-    /// keep track of all log file command length. Key is term, value is command length
-    log_lengths: HashMap<usize, usize>,
-
     /// keep track of current term
     term: usize,
 
+    /// keep track of all log file command length. Key is term, value is command length
+    log_lengths: HashMap<usize, usize>,
+
     /// current term (log file id), start with 1 and continue growing
-    num_command: usize,
+    current_log_len: usize,
 
     /// keep track the current writing log file command length
     log_path: PathBuf,
@@ -111,7 +111,7 @@ impl KvStore {
         let mut readers: HashMap<usize, BufReader<File>> = HashMap::new();
         let mut log_lengths: HashMap<usize, usize> = HashMap::new();
         let mut last_log_path: OsString = path.join("kvs.store/1").into_os_string();
-        let mut num_command: usize = 0;
+        let mut current_log_len: usize = 0;
 
         if !log_path.is_dir() {
             create_dir_all(&log_path).expect("log file folder creation failed");
@@ -141,14 +141,13 @@ impl KvStore {
                     panic!("While opening logs, term current is small or equal to term.");
                 }
 
-
                 // open the file firstly for reading to load data on open
                 let file = BufReader::new(OpenOptions::new().read(true).open(&entry.path())?);
                 let mut stream = Deserializer::from_reader(file).into_iter::<Command>(); // https://docs.serde.rs/serde_json/de/struct.StreamDeserializer.html
                 let mut head: usize = 0;
                 let mut tail: usize;
 
-                num_command = 0;
+                current_log_len = 0;
                 while let Some(command) = stream.next() {
                     tail = stream.byte_offset();
 
@@ -156,11 +155,11 @@ impl KvStore {
                         match command {
                             Command::Set { key, value: _ } => {
                                 map.insert(key, ValueIndex { term: current_term, head, tail });
-                                num_command += 1;
+                                current_log_len += 1;
                             }
                             Command::Remove { key } => {
                                 map.remove(key.as_str());
-                                num_command += 1;
+                                current_log_len += 1;
                             }
                         }
                     }
@@ -171,7 +170,7 @@ impl KvStore {
                 // then open again and it save as a it as a value reader
                 let reader = BufReader::new(OpenOptions::new().read(true).open(&entry.path())?);
                 readers.insert(current_term, reader);
-                log_lengths.insert(current_term, num_command);
+                log_lengths.insert(current_term, current_log_len);
 
                 // prepare for next loop
                 term = current_term;
@@ -194,22 +193,22 @@ impl KvStore {
         if log_file_count == 0 {
             let reader = BufReader::new(OpenOptions::new().read(true).open(&last_log_path)?);
             readers.insert(term, reader);
-            log_lengths.insert(term, num_command);
+            log_lengths.insert(term, current_log_len);
         }
 
         Ok(KvStore {
             map,
             writer,
             readers,
-            log_lengths,
             term,
-            num_command,
+            log_lengths,
+            current_log_len,
             log_path,
         })
     }
 
     fn break_to_new_log_file(&mut self) -> R<()> {
-        if self.num_command >= MAX_NUM_COMMAND_PER_FILE {
+        if self.current_log_len >= MAX_NUM_COMMAND_PER_FILE {
             self.term += 1;
 
             let new_log_path = self.log_path.join(self.term.to_string());
@@ -225,7 +224,7 @@ impl KvStore {
             let reader = BufReader::new(OpenOptions::new().read(true).open(&new_log_path)?);
             self.readers.insert(self.term, reader);
             self.log_lengths.insert(self.term, 0);
-            self.num_command = 0;
+            self.current_log_len = 0;
         }
 
         Ok(())
@@ -258,6 +257,12 @@ impl KvStore {
     }
 
     /// Set key value to store
+    ///
+    /// Operation include:
+    /// * write command to file
+    /// * update log_lengths map
+    /// * update current_log_len
+    /// * update index map
     pub fn set(&mut self, key: String, value: String) -> R<()> {
         let command = Command::set(key, value);
 
@@ -268,7 +273,7 @@ impl KvStore {
         serde_json::to_writer(&mut self.writer, &command)?;
         self.writer.flush()?;
         *self.log_lengths.entry(self.term).or_insert(0) += 1;
-        self.num_command += 1;
+        self.current_log_len += 1;
 
         match command {
             Command::Set { key, value: _ } => {
@@ -301,7 +306,7 @@ impl KvStore {
         self.writer.flush()?;
         // increase log count
         *self.log_lengths.entry(self.term).or_insert(0) += 1;
-        self.num_command += 1;
+        self.current_log_len += 1;
 
         match command {
             Command::Remove { key } => {
