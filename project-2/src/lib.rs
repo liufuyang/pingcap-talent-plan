@@ -16,3 +16,4 @@ pub use store::KvStore;
 
 mod error;
 mod store;
+mod counter;

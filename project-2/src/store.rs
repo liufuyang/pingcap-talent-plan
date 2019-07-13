@@ -10,6 +10,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
+use crate::counter::LengthCount;
 use crate::error::{KvsError, Result};
 
 type R<T> = Result<T>;
@@ -46,42 +47,57 @@ struct ValueIndex {
     tail: usize,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct LengthCount {
-    /// Total length of a log
-    len: usize,
-    /// Length of garbage
-    len_garbage: usize,
-}
-
-impl LengthCount {
-    pub fn new () -> Self {
-        LengthCount{ len: 0, len_garbage: 0}
-    }
-
-    pub fn effective_len(&self) -> usize {
-        self.len - self.len_garbage
-    }
-
-    pub fn increase_len(&mut self) {
-        self.len += 1;
-    }
-
-    pub fn increase_garbage_len(&mut self) {
-        self.len_garbage += 1;
-    }
-
-    pub fn increase_len_with_garbage(&mut self) {
-        self.len += 1;
-        self.len_garbage += 1;
-    }
-
-    pub fn garbage_rate(&self) -> f64{
-        self.len_garbage as f64 / self.len as f64
-    }
-}
-
 /// A store that keeps key-value pairs in memory
+///
+/// When storing the values related to those keys, file positions/offsets are saved as values in an
+/// index map in memory.
+///
+/// For example:
+/// ```
+/// (set k1, v1) -> (0, 33)
+/// (set k2, v2) -> (33, 66)
+/// (rm k1)      -> (66, 89)
+/// (set k3, v3) -> (89, 122)
+/// ```
+///
+/// KvStore has a writer: CursorBufWriter, which has a filed `pos` is used for keep track of the
+/// current position/cursor of the end of the file.
+///
+/// After loading the above example, `writer.pos` will be set as 122.
+///
+/// When adding another (set k4, v4) key-value pair, the value (122, 155) is inserted into index map,
+/// which can be retrieved by k4. And `writer.pos` will be set as 155.
+///
+/// --------------------------------------------------------------------------------------------
+///
+/// ## Multi-log-file version notes:
+///
+/// Keep a value of term: u64 in KvStore to keep track of the current term (start with 1, continue to grow).
+/// Write commands into file under /path/kvs.store/1.log.
+/// And when the number of commands reach MAX_NUM_COMMAND_PER_FILE, increase term by 1, then start writing to
+/// /path/kvs.store/2.log
+///
+/// When storing the values related to those keys, file the term number and positions/offsets are saved as values.
+/// For example:
+/// ```
+/// (set k1, v1) -> (1, 0, 33)
+/// (set k2, v2) -> (1, 33, 66)
+/// (rm k1)      -> (1, 66, 89)
+/// (set k3, v3) -> (1, 89, 122)
+///
+/// (set k4, v4) -> (2, 0, 33)  # this writes into a new file
+/// ```
+/// We keep a number of readers in a readers map to keep a reader for each log file.
+/// We also keep the log file length for each log file in `log_lengths`
+///
+/// An example log file would look something like
+/// ```
+/// {"Set":{"key":"k1","value":"v1"}}{"Remove":{"key":"k1"}}{"Set":{"key":"k1","value":"v1"}}{"Set":{"key":"k2","value":"v2"}}
+/// ```
+///
+/// ## Examples:
+///
+/// This is am example how you can use this KvStore:
 /// ```rust
 /// # use kvs::KvStore;
 /// let mut store = KvStore::open("./");
@@ -96,47 +112,15 @@ impl KvStore {
     /// Create or scan a logfile and create a KvStore from it.
     ///
     /// The this open function will firstly scan through the log file which are concatenated with
-    /// multiple JSON elements. And for all the SET entity, store the key to the map; while for all
-    /// the REMOVE entity, remove the key from the map.
+    /// multiple JSON elements.
+    /// * And for all the SET command, store the key to the index map
+    /// * while for all the REMOVE command, remove the key from the index map
     ///
-    /// When storing the values related to those keys, file positions/offsets are saved as values.
-    /// For example:
-    /// ```
-    /// (set k1, v1) -> (0, 33)
-    /// (set k2, v2) -> (33, 66)
-    /// (rm k1)      -> (66, 89)
-    /// (set k3, v3) -> (89, 122)
-    /// ```
+    /// At the same time, log_lengths - a map keeps track of all log file command length is also
+    /// created in memory.
     ///
-    /// KvStore has a writer: CursorBufWriter, which has a filed `pos` is used for keep track of the
-    /// current position/cursor of the end of the file.
-    ///
-    /// After loading the above example, `writer.pos` will be set as 122.
-    ///
-    /// When adding another (set k4, v4) key-value pair, the value (122, 155) is inserted into index map,
-    /// which can be retrieved by k4. And `writer.pos` will be set as 155.
-    ///
-    /// --------------------------------------------------------------------------------------------
-    ///
-    /// ## Multi-log-file version notes:
-    ///
-    /// Keep a value of term: u64 in KvStore to keep track of the current term (start with 1, continue to grow).
-    /// Write commands into file under /path/kvs.store/1.log.
-    /// And when the number of commands reach MAX_NUM_COMMAND_PER_FILE, increase term by 1, then start writing to
-    /// /path/kvs.store/2.log
-    ///
-    /// When storing the values related to those keys, file the term number and positions/offsets are saved as values.
-    /// For example:
-    /// ```
-    /// (set k1, v1) -> (1, 0, 33)
-    /// (set k2, v2) -> (1, 33, 66)
-    /// (rm k1)      -> (1, 66, 89)
-    /// (set k3, v3) -> (1, 89, 122)
-    ///
-    /// (set k4, v4) -> (2, 0, 33)  # this writes into a new file
-    /// ```
-    /// We keep a number of readers in a readers map to keep a reader for each log file.
-    /// We also keep the log file length for each log file in `log_lengths`
+    /// Also a reader for each term file is created, and a writer is created for the last term file
+    /// to append on.
     ///
     pub fn open(path: impl Into<PathBuf>) -> R<KvStore> {
         let path = path.into();
@@ -300,11 +284,6 @@ impl KvStore {
     }
 
     /// Get value by a key from store
-    ///
-    /// An example log file would look something like
-    /// ```
-    /// {"Set":{"key":"k1","value":"v1"}}{"Remove":{"key":"k1"}}{"Set":{"key":"k1","value":"v1"}}{"Set":{"key":"k2","value":"v2"}}
-    /// ```
     pub fn get(&mut self, key: String) -> R<Option<String>> {
         let index = match self.map.get(&key) {
             Some(index) => index,
@@ -393,6 +372,12 @@ impl KvStore {
     }
 
     /// Remove key value from store
+    ///
+    /// Operation include:
+    /// * write command to file
+    /// * update log_lengths map
+    /// * update current_log_len
+    /// * update index map
     pub fn remove(&mut self, key: String) -> R<()> {
         // check key exit:
         if !self.map.contains_key(key.as_str()) {
@@ -447,6 +432,7 @@ impl KvStore {
         Ok(())
     }
 
+    /// Compaction
     fn compaction(&mut self, term: usize) -> R<()> {
         let mut reader = self.readers.remove(&term).expect("Get old reader failed");
         reader.seek(SeekFrom::Start(0))?;
@@ -474,6 +460,7 @@ impl KvStore {
         if effective_element_len != temp_map_len {
             panic!(format!("Compaction bug: effective element number {} is different from temp_map len {}", effective_element_len, temp_map_len));
         }
+
         // TODO - delete
         println!("Garbage collect on term: {}, writing {} previous active commands.", term, effective_element_len);
 
