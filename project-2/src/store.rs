@@ -65,11 +65,12 @@ impl KvStore {
     ///
     /// When storing the values related to those keys, file positions/offsets are saved as values.
     /// For example:
-    ///
+    /// ```
     /// (set k1, v1) -> (0, 33)
     /// (set k2, v2) -> (33, 66)
     /// (rm k1)      -> (66, 89)
     /// (set k3, v3) -> (89, 122)
+    /// ```
     ///
     /// KvStore has a writer: CursorBufWriter, which has a filed `pos` is used for keep track of the
     /// current position/cursor of the end of the file.
@@ -81,7 +82,7 @@ impl KvStore {
     ///
     /// --------------------------------------------------------------------------------------------
     ///
-    /// Multi-log-file version notes:
+    /// ## Multi-log-file version notes:
     ///
     /// Keep a value of term: u64 in KvStore to keep track of the current term (start with 1, continue to grow).
     /// Write commands into file under /path/kvs.store/1.log.
@@ -90,14 +91,14 @@ impl KvStore {
     ///
     /// When storing the values related to those keys, file the term number and positions/offsets are saved as values.
     /// For example:
-    ///
+    /// ```
     /// (set k1, v1) -> (1, 0, 33)
     /// (set k2, v2) -> (1, 33, 66)
     /// (rm k1)      -> (1, 66, 89)
     /// (set k3, v3) -> (1, 89, 122)
     ///
     /// (set k4, v4) -> (2, 0, 33)  # this writes into a new file
-    ///
+    /// ```
     /// We keep a number of readers in a readers map to keep a reader for each log file.
     /// We also keep the log file length for each log file in `log_lengths`
     ///
