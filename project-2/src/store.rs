@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::fs::{create_dir_all, File, OpenOptions, DirEntry};
+use std::fs::{create_dir_all, DirEntry, File, OpenOptions};
 use std::io;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::io::Read;
@@ -14,21 +14,27 @@ use crate::error::{KvsError, Result};
 
 type R<T> = Result<T>;
 
-const MAX_NUM_COMMAND_PER_FILE: usize = 4;
+const MAX_NUM_COMMAND_PER_FILE: usize = 1_000_000;
 
 /// The struct to hold key value pairs.
 /// Currently it uses memory storage.
 pub struct KvStore {
+    /// index map, key as store String key, value as indexes to find the actual String value
     map: BTreeMap<String, ValueIndex>,
 
     writer: CursorBufWriter<File>,
     readers: HashMap<usize, BufReader<File>>,
-    log_lengths: HashMap<usize, usize>, // keep track of all log file command length. Key is term, value is command length
 
+    /// keep track of all log file command length. Key is term, value is command length
+    log_lengths: HashMap<usize, usize>,
+
+    /// keep track of current term
     term: usize,
-    // current term (log file id), start with 1 and continue growing
+
+    /// current term (log file id), start with 1 and continue growing
     num_command: usize,
-    // keep track the current writing log file command length
+
+    /// keep track the current writing log file command length
     log_path: PathBuf,
 }
 
@@ -60,10 +66,10 @@ impl KvStore {
     /// When storing the values related to those keys, file positions/offsets are saved as values.
     /// For example:
     ///
-    /// (set k1, v1) - (0, 33)
-    /// (set k2, v2) - (33, 66)
-    /// (rm k1) - (66, 89)
-    /// (set k3, v3) - (89, 122)
+    /// (set k1, v1) -> (0, 33)
+    /// (set k2, v2) -> (33, 66)
+    /// (rm k1)      -> (66, 89)
+    /// (set k3, v3) -> (89, 122)
     ///
     /// KvStore has a writer: CursorBufWriter, which has a filed `pos` is used for keep track of the
     /// current position/cursor of the end of the file.
@@ -82,15 +88,15 @@ impl KvStore {
     /// And when the number of commands reach MAX_NUM_COMMAND_PER_FILE, increase term by 1, then start writing to
     /// /path/kvs.store/2.log
     ///
-    /// When storing the values related to those keys, file positions/offsets are saved as values.
+    /// When storing the values related to those keys, file the term number and positions/offsets are saved as values.
     /// For example:
     ///
-    /// (set k1, v1) - (1, 0, 33)
-    /// (set k2, v2) - (1, 33, 66)
-    /// (rm k1) - (1, 66, 89)
-    /// (set k3, v3) - (1, 89, 122)
+    /// (set k1, v1) -> (1, 0, 33)
+    /// (set k2, v2) -> (1, 33, 66)
+    /// (rm k1)      -> (1, 66, 89)
+    /// (set k3, v3) -> (1, 89, 122)
     ///
-    /// (set k4, v4) - (2, 0, 33)
+    /// (set k4, v4) -> (2, 0, 33)  # this writes into a new file
     ///
     /// We keep a number of readers in a readers map to keep a reader for each log file.
     /// We also keep the log file length for each log file in `log_lengths`
@@ -225,6 +231,32 @@ impl KvStore {
         Ok(())
     }
 
+    /// Get value by a key from store
+    ///
+    /// An example log file would look something like
+    /// ```
+    /// {"Set":{"key":"k1","value":"v1"}}{"Remove":{"key":"k1"}}{"Set":{"key":"k1","value":"v1"}}{"Set":{"key":"k2","value":"v2"}}
+    /// ```
+    pub fn get(&mut self, key: String) -> R<Option<String>> {
+        let index = match self.map.get(&key) {
+            Some(index) => index,
+            None => return Ok(None),
+        };
+
+        let reader = self.readers.get_mut(&index.term).expect(&format!("reader with term {} not exist", &index.term));
+        reader.seek(SeekFrom::Start(index.head as u64))?;
+        let mut buf = vec![0u8; index.tail - index.head]; // https://stackoverflow.com/questions/30412521/how-to-read-a-specific-number-of-bytes-from-a-stream
+        reader.read_exact(&mut buf)?;
+        let command: Command = serde_json::from_slice(&buf)?;
+
+        match command {
+            Command::Set { key: _, value } => {
+                return Ok(Option::Some(value));
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// Set key value to store
     pub fn set(&mut self, key: String, value: String) -> R<()> {
         let command = Command::set(key, value);
@@ -251,27 +283,6 @@ impl KvStore {
         }
 
         Ok(())
-    }
-
-    /// Get value by a key from store
-    pub fn get(&mut self, key: String) -> R<Option<String>> {
-        let index = match self.map.get(&key) {
-            Some(index) => index,
-            None => return Ok(None),
-        };
-
-        let reader = self.readers.get_mut(&index.term).expect(&format!("reader with term {} not exist", &index.term ));
-        reader.seek(SeekFrom::Start(index.head as u64))?;
-        let mut buf = vec![0u8; index.tail - index.head]; // https://stackoverflow.com/questions/30412521/how-to-read-a-specific-number-of-bytes-from-a-stream
-        reader.read_exact(&mut buf)?;
-        let command: Command = serde_json::from_slice(&buf)?;
-
-        match command {
-            Command::Set { key: _, value } => {
-                return Ok(Option::Some(value));
-            }
-            _ => unreachable!(),
-        }
     }
 
     /// Remove key value from store
