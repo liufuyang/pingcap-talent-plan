@@ -256,8 +256,7 @@ fn remove_key() -> Result<()> {
 
 // Insert data until total size of the directory decreases.
 // Test data correctness after compaction.
-// TODO comment this test for now
-// #[test]
+#[test]
 fn compaction() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     println!("Temp dir: {}", &temp_dir.path().to_str().unwrap());

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::fs::{create_dir_all, DirEntry, File, OpenOptions};
+use std::fs::{create_dir_all, DirEntry, File, OpenOptions, remove_file};
 use std::io;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::io::Read;
@@ -14,8 +14,8 @@ use crate::error::{KvsError, Result};
 
 type R<T> = Result<T>;
 
-const MAX_NUM_COMMAND_PER_FILE: usize = 1_000_000;
-const COMPACTION_THRESHOLD: f64 = 0.5;
+const MAX_NUM_COMMAND_PER_FILE: usize = 1000;
+const COMPACTION_THRESHOLD: f64 = 0.8;
 
 /// The struct to hold key value pairs.
 /// Currently it uses memory storage.
@@ -26,16 +26,16 @@ pub struct KvStore {
     writer: CursorBufWriter<File>,
     readers: HashMap<usize, BufReader<File>>,
 
-    /// keep track of current term
+    /// current term (log file id), start with 1 and continue growing
     term: usize,
 
     /// keep track of all log file command length. Key is term, value is command length
     log_lengths: HashMap<usize, LengthCount>,
 
-    /// current term (log file id), start with 1 and continue growing
+    /// keep track the current writing log file command length
     current_log_len: usize,
 
-    /// keep track the current writing log file command length
+    /// keep track of the current dir for saving log files
     log_path: PathBuf,
 }
 
@@ -59,8 +59,8 @@ impl LengthCount {
         LengthCount{ len: 0, len_garbage: 0}
     }
 
-    pub fn get_len(&self) -> usize {
-        self.len
+    pub fn effective_len(&self) -> usize {
+        self.len - self.len_garbage
     }
 
     pub fn increase_len(&mut self) {
@@ -74,6 +74,10 @@ impl LengthCount {
     pub fn increase_len_with_garbage(&mut self) {
         self.len += 1;
         self.len_garbage += 1;
+    }
+
+    pub fn garbage_rate(&self) -> f64{
+        self.len_garbage as f64 / self.len as f64
     }
 }
 
@@ -314,7 +318,7 @@ impl KvStore {
         let command: Command = serde_json::from_slice(&buf)?;
 
         // TODO: delete
-        println!("log_lengths: {:?}", self.log_lengths);
+        // println!("log_lengths: {:?}", self.log_lengths);
 
         match command {
             Command::Set { key: _, value } => {
@@ -347,6 +351,7 @@ impl KvStore {
 
         // increase log count
         // if the key already set before, then garbage exist
+        let mut compaction_term: usize = 0;
         if let Some(old_index) = self.map.get(&key) {
             if old_index.term == self.term { // garbage at current term
                 let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
@@ -354,6 +359,11 @@ impl KvStore {
             } else { // garbage at previous term
                 let old_log_len_count = self.log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
                 old_log_len_count.increase_garbage_len();
+
+                if old_log_len_count.garbage_rate() > COMPACTION_THRESHOLD {
+                    compaction_term = old_index.term;
+                }
+
                 let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
                 current_log_len_count.increase_len();
             }
@@ -373,7 +383,11 @@ impl KvStore {
 
 
         // TODO: delete
-        println!("log_lengths: {:?}", self.log_lengths);
+        // println!("log_lengths: {:?}", self.log_lengths);
+
+        if compaction_term > 0 {
+            self.compaction(compaction_term)?;
+        }
 
         Ok(())
     }
@@ -399,6 +413,7 @@ impl KvStore {
 
         // increase log count
         // if the key already set before (here should always be true), then garbage exist
+        let mut compaction_term: usize = 0;
         if let Some(old_index) = self.map.get(&key) {
             if old_index.term == self.term { // garbage at current term
                 let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
@@ -407,6 +422,9 @@ impl KvStore {
             } else { // garbage at previous term
                 let old_log_len_count = self.log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
                 old_log_len_count.increase_garbage_len();
+                if old_log_len_count.garbage_rate() > COMPACTION_THRESHOLD {
+                    compaction_term = old_index.term;
+                }
                 let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
                 current_log_len_count.increase_len_with_garbage();
             }
@@ -420,7 +438,52 @@ impl KvStore {
 
 
         // TODO: delete
-        println!("log_lengths: {:?}", self.log_lengths);
+        // println!("log_lengths: {:?}", self.log_lengths);
+
+        if compaction_term > 0 {
+            self.compaction(compaction_term)?;
+        }
+
+        Ok(())
+    }
+
+    fn compaction(&mut self, term: usize) -> R<()> {
+        let mut reader = self.readers.remove(&term).expect("Get old reader failed");
+        reader.seek(SeekFrom::Start(0))?;
+
+        let mut temp_map: HashMap<String, String> = HashMap::new();
+
+        let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
+        while let Some(command) = stream.next() {
+            if let Ok(command) = command {
+                match command {
+                    Command::Set {key, value} => {
+                        if let Some(index) = self.map.get(&key) {
+                            if index.term == term { // meaning this key value pair is still valid and stored in this term
+                                temp_map.insert(key, value);
+                            }
+                        }
+                    },
+                    _ => (),
+                }
+            }
+        }
+
+        let effective_element_len = self.log_lengths.get(&term).unwrap().effective_len();
+        let temp_map_len = temp_map.len();
+        if effective_element_len != temp_map_len {
+            panic!(format!("Compaction bug: effective element number {} is different from temp_map len {}", effective_element_len, temp_map_len));
+        }
+        // TODO - delete
+        println!("Garbage collect on term: {}, writing {} previous active commands.", term, effective_element_len);
+
+        for (k, v) in temp_map.into_iter() {
+            self.map.remove(&k).expect("Compaction error - remove key from index map");
+            self.set(k, v)?;
+        }
+        self.log_lengths.remove(&term).expect("Compaction error - remove term from log_lengths");
+        // finally delete the file
+        remove_file(self.log_path.join(term.to_string()))?;
 
         Ok(())
     }
