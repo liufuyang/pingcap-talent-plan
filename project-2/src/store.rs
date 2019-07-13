@@ -15,8 +15,8 @@ use crate::error::{KvsError, Result};
 
 type R<T> = Result<T>;
 
-const MAX_NUM_COMMAND_PER_FILE: usize = 1000;
-const COMPACTION_THRESHOLD: f64 = 0.8;
+const MAX_NUM_COMMAND_PER_FILE: usize = 1024;
+const COMPACTION_THRESHOLD: f64 = 0.618;
 
 /// The struct to hold key value pairs.
 /// Currently it uses memory storage.
@@ -263,29 +263,6 @@ impl KvStore {
         })
     }
 
-    fn break_to_new_log_file(&mut self) -> R<()> {
-        if self.current_log_len >= MAX_NUM_COMMAND_PER_FILE {
-            self.term += 1;
-
-            let new_log_path = self.log_path.join(self.term.to_string());
-
-            self.writer = CursorBufWriter::new(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&new_log_path)?,
-            )?;
-
-            // then open again and it save as a it as a value reader
-            let reader = BufReader::new(OpenOptions::new().read(true).open(&new_log_path)?);
-            self.readers.insert(self.term, reader);
-            self.log_lengths.insert(self.term, LengthCount::new());
-            self.current_log_len = 0;
-        }
-
-        Ok(())
-    }
-
     /// Get value by a key from store
     pub fn get(&mut self, key: String) -> R<Option<String>> {
         let index = match self.map.get(&key) {
@@ -319,7 +296,9 @@ impl KvStore {
     /// * update index map
     pub fn set(&mut self, key: String, value: String) -> R<()> {
         // break file if reaching limit
-        self.break_to_new_log_file()?;
+        if self.current_log_len >= MAX_NUM_COMMAND_PER_FILE {
+            self.break_to_new_log_file()?;
+        }
 
         let command = Command::set(key, value);
         let pos_current = self.writer.pos;
@@ -338,6 +317,10 @@ impl KvStore {
             if old_index.term == self.term { // garbage at current term
                 let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
                 current_log_len_count.increase_len_with_garbage();
+
+                if current_log_len_count.garbage_rate() > COMPACTION_THRESHOLD {
+                    compaction_term = self.term;
+                }
             } else { // garbage at previous term
                 let old_log_len_count = self.log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
                 old_log_len_count.increase_garbage_len();
@@ -367,7 +350,7 @@ impl KvStore {
         // TODO: delete
         // println!("log_lengths: {:?}", self.log_lengths);
 
-        if compaction_term > 0 {
+        if compaction_term > 0  {
             self.compaction(compaction_term)?;
         }
 
@@ -388,7 +371,9 @@ impl KvStore {
         }
 
         // break file if reaching limit
-        self.break_to_new_log_file()?;
+        if self.current_log_len >= MAX_NUM_COMMAND_PER_FILE {
+            self.break_to_new_log_file()?;
+        }
 
         let command = Command::remove(key);
         serde_json::to_writer(&mut self.writer, &command)?;
@@ -407,6 +392,10 @@ impl KvStore {
                 let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
                 current_log_len_count.increase_garbage_len(); // count the set command as garbage
                 current_log_len_count.increase_len_with_garbage(); // increase length and count the remove command is also garbage
+
+                if current_log_len_count.garbage_rate() > COMPACTION_THRESHOLD {
+                    compaction_term = self.term;
+                }
             } else { // garbage at previous term
                 let old_log_len_count = self.log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
                 old_log_len_count.increase_garbage_len();
@@ -435,6 +424,28 @@ impl KvStore {
         Ok(())
     }
 
+    fn break_to_new_log_file(&mut self) -> R<()> {
+
+        self.term += 1;
+
+        let new_log_path = self.log_path.join(self.term.to_string());
+
+        self.writer = CursorBufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&new_log_path)?,
+        )?;
+
+        // then open again and it save as a it as a value reader
+        let reader = BufReader::new(OpenOptions::new().read(true).open(&new_log_path)?);
+        self.readers.insert(self.term, reader);
+        self.log_lengths.insert(self.term, LengthCount::new());
+        self.current_log_len = 0;
+
+        Ok(())
+    }
+
     /// Compaction
     ///
     /// This function is called when we know a log file of certain term has it's
@@ -449,6 +460,14 @@ impl KvStore {
     /// update log_lengths map, then finally remove the term file.
     ///
     fn compaction(&mut self, term: usize) -> R<()> {
+        // check whether compaction happening on the same file
+        // if so, and when only when self.current_log_len < MAX_NUM_COMMAND_PER_FILE
+        // (meaning break_to_new_log_file() won't be called immediately when self.set(..) is called)
+        // we make a new term and file to write
+        if term == self.term && self.current_log_len < MAX_NUM_COMMAND_PER_FILE{
+            self.break_to_new_log_file()?;
+        }
+
         let mut reader = self.readers.remove(&term).expect("Get old reader failed");
         reader.seek(SeekFrom::Start(0))?;
 
@@ -477,7 +496,7 @@ impl KvStore {
         }
 
         // TODO - delete
-        println!("Garbage collect on term: {}, writing {} previous active commands.", term, effective_element_len);
+        // println!("Garbage collect on term: {}, writing {} previous active commands.", term, effective_element_len);
 
         for (k, v) in temp_map.into_iter() {
             self.map.remove(&k).expect("Compaction error - remove key from index map");
