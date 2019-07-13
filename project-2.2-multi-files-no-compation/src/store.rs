@@ -15,7 +15,6 @@ use crate::error::{KvsError, Result};
 type R<T> = Result<T>;
 
 const MAX_NUM_COMMAND_PER_FILE: usize = 1_000_000;
-const COMPACTION_THRESHOLD: f64 = 0.5;
 
 /// The struct to hold key value pairs.
 /// Currently it uses memory storage.
@@ -30,7 +29,7 @@ pub struct KvStore {
     term: usize,
 
     /// keep track of all log file command length. Key is term, value is command length
-    log_lengths: HashMap<usize, LengthCount>,
+    log_lengths: HashMap<usize, usize>,
 
     /// current term (log file id), start with 1 and continue growing
     current_log_len: usize,
@@ -44,37 +43,6 @@ struct ValueIndex {
     term: usize,
     head: usize,
     tail: usize,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct LengthCount {
-    /// Total length of a log
-    len: usize,
-    /// Length of garbage
-    len_garbage: usize,
-}
-
-impl LengthCount {
-    pub fn new () -> Self {
-        LengthCount{ len: 0, len_garbage: 0}
-    }
-
-    pub fn get_len(&self) -> usize {
-        self.len
-    }
-
-    pub fn increase_len(&mut self) {
-        self.len += 1;
-    }
-
-    pub fn increase_garbage_len(&mut self) {
-        self.len_garbage += 1;
-    }
-
-    pub fn increase_len_with_garbage(&mut self) {
-        self.len += 1;
-        self.len_garbage += 1;
-    }
 }
 
 /// A store that keeps key-value pairs in memory
@@ -139,10 +107,10 @@ impl KvStore {
         let log_path = path.join("kvs.store");
 
         // multi file
-        let mut map: BTreeMap<String, ValueIndex> = BTreeMap::new();
+        let mut map = BTreeMap::new();
         let mut term: usize;
         let mut readers: HashMap<usize, BufReader<File>> = HashMap::new();
-        let mut log_lengths: HashMap<usize, LengthCount> = HashMap::new();
+        let mut log_lengths: HashMap<usize, usize> = HashMap::new();
         let mut last_log_path: OsString = path.join("kvs.store/1").into_os_string();
         let mut current_log_len: usize = 0;
 
@@ -180,49 +148,17 @@ impl KvStore {
                 let mut head: usize = 0;
                 let mut tail: usize;
 
-                let mut current_log_len_count = LengthCount::new();
-
                 current_log_len = 0;
-
                 while let Some(command) = stream.next() {
                     tail = stream.byte_offset();
 
                     if let Ok(command) = command {
                         match command {
                             Command::Set { key, value: _ } => {
-
-                                // if the key already set before, then garbage exist
-                                if let Some(old_index) =  map.get(&key) {
-                                    if old_index.term == current_term { // garbage at current term
-                                        current_log_len_count.increase_len_with_garbage();
-                                    } else { // garbage at previous term
-                                        let old_log_len_count = log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
-                                        old_log_len_count.increase_garbage_len();
-                                        current_log_len_count.increase_len();
-                                    }
-                                } else { // a new set key
-                                    current_log_len_count.increase_len();
-                                }
-
                                 map.insert(key, ValueIndex { term: current_term, head, tail });
                                 current_log_len += 1;
                             }
                             Command::Remove { key } => {
-
-                                // if the key already set before (here should always be true), then garbage exist
-                                if let Some(old_index) =  map.get(&key) {
-                                    if old_index.term == current_term { // garbage at current term
-                                        current_log_len_count.increase_garbage_len(); // count the set command as garbage
-                                        current_log_len_count.increase_len_with_garbage(); // increase length and count the remove command is also garbage
-                                    } else { // garbage at previous term
-                                        let old_log_len_count = log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
-                                        old_log_len_count.increase_garbage_len();
-                                        current_log_len_count.increase_len_with_garbage();
-                                    }
-                                } else {
-                                    println!("Warning: on opening, a Remove command encounter but without any previous set. Neglect it and moving on.");
-                                }
-
                                 map.remove(key.as_str());
                                 current_log_len += 1;
                             }
@@ -235,7 +171,7 @@ impl KvStore {
                 // then open again and it save as a it as a value reader
                 let reader = BufReader::new(OpenOptions::new().read(true).open(&entry.path())?);
                 readers.insert(current_term, reader);
-                log_lengths.insert(current_term, current_log_len_count);
+                log_lengths.insert(current_term, current_log_len);
 
                 // prepare for next loop
                 term = current_term;
@@ -258,7 +194,7 @@ impl KvStore {
         if log_file_count == 0 {
             let reader = BufReader::new(OpenOptions::new().read(true).open(&last_log_path)?);
             readers.insert(term, reader);
-            log_lengths.insert(term, LengthCount::new());
+            log_lengths.insert(term, current_log_len);
         }
 
         Ok(KvStore {
@@ -288,7 +224,7 @@ impl KvStore {
             // then open again and it save as a it as a value reader
             let reader = BufReader::new(OpenOptions::new().read(true).open(&new_log_path)?);
             self.readers.insert(self.term, reader);
-            self.log_lengths.insert(self.term, LengthCount::new());
+            self.log_lengths.insert(self.term, 0);
             self.current_log_len = 0;
         }
 
@@ -313,9 +249,6 @@ impl KvStore {
         reader.read_exact(&mut buf)?;
         let command: Command = serde_json::from_slice(&buf)?;
 
-        // TODO: delete
-        println!("log_lengths: {:?}", self.log_lengths);
-
         match command {
             Command::Set { key: _, value } => {
                 return Ok(Option::Some(value));
@@ -332,48 +265,28 @@ impl KvStore {
     /// * update current_log_len
     /// * update index map
     pub fn set(&mut self, key: String, value: String) -> R<()> {
+        let command = Command::set(key, value);
+
         // break file if reaching limit
         self.break_to_new_log_file()?;
 
-        let command = Command::set(key, value);
         let pos_current = self.writer.pos;
         serde_json::to_writer(&mut self.writer, &command)?;
         self.writer.flush()?;
-
-        let key = match command { // own String key again
-            Command::Set{ key, value: _} => key,
-            _ => unreachable!()
-        };
-
-        // increase log count
-        // if the key already set before, then garbage exist
-        if let Some(old_index) = self.map.get(&key) {
-            if old_index.term == self.term { // garbage at current term
-                let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
-                current_log_len_count.increase_len_with_garbage();
-            } else { // garbage at previous term
-                let old_log_len_count = self.log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
-                old_log_len_count.increase_garbage_len();
-                let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
-                current_log_len_count.increase_len();
-            }
-        } else { // this is a new key
-            let current_log_len_count = self.log_lengths.entry(self.term).or_insert(LengthCount::new());
-            current_log_len_count.increase_len();
-        }
-
+        *self.log_lengths.entry(self.term).or_insert(0) += 1;
         self.current_log_len += 1;
 
-        self.map
-            .insert(key, ValueIndex {
-                term: self.term,
-                head: pos_current as usize,
-                tail: self.writer.pos as usize,
-            });
-
-
-        // TODO: delete
-        println!("log_lengths: {:?}", self.log_lengths);
+        match command {
+            Command::Set { key, value: _ } => {
+                self.map
+                    .insert(key, ValueIndex {
+                        term: self.term,
+                        head: pos_current as usize,
+                        tail: self.writer.pos as usize,
+                    });
+            }
+            _ => unreachable!(),
+        }
 
         Ok(())
     }
@@ -389,38 +302,19 @@ impl KvStore {
         self.break_to_new_log_file()?;
 
         let command = Command::remove(key);
+
         serde_json::to_writer(&mut self.writer, &command)?;
         self.writer.flush()?;
-
-        let key = match command { // own String key again
-            Command::Remove{ key} => key,
-            _ => unreachable!()
-        };
-
         // increase log count
-        // if the key already set before (here should always be true), then garbage exist
-        if let Some(old_index) = self.map.get(&key) {
-            if old_index.term == self.term { // garbage at current term
-                let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
-                current_log_len_count.increase_garbage_len(); // count the set command as garbage
-                current_log_len_count.increase_len_with_garbage(); // increase length and count the remove command is also garbage
-            } else { // garbage at previous term
-                let old_log_len_count = self.log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
-                old_log_len_count.increase_garbage_len();
-                let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
-                current_log_len_count.increase_len_with_garbage();
-            }
-        } else {
-            unreachable!();
-        }
-
+        *self.log_lengths.entry(self.term).or_insert(0) += 1;
         self.current_log_len += 1;
 
-        self.map.remove(key.as_str());
-
-
-        // TODO: delete
-        println!("log_lengths: {:?}", self.log_lengths);
+        match command {
+            Command::Remove { key } => {
+                self.map.remove(key.as_str());
+            }
+            _ => unreachable!(),
+        }
 
         Ok(())
     }
