@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::fs::{create_dir_all, DirEntry, File, OpenOptions};
+use std::fs::{create_dir_all, DirEntry, File, OpenOptions, remove_file};
 use std::io;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::io::Read;
@@ -10,11 +10,13 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
+use crate::counter::LengthCount;
 use crate::error::{KvsError, Result};
 
 type R<T> = Result<T>;
 
-const MAX_NUM_COMMAND_PER_FILE: usize = 1_000_000;
+const MAX_NUM_COMMAND_PER_FILE: usize = 1000;
+const COMPACTION_THRESHOLD: f64 = 0.8;
 
 /// The struct to hold key value pairs.
 /// Currently it uses memory storage.
@@ -25,16 +27,16 @@ pub struct KvStore {
     writer: CursorBufWriter<File>,
     readers: HashMap<usize, BufReader<File>>,
 
-    /// keep track of current term
+    /// current term (log file id), start with 1 and continue growing
     term: usize,
 
     /// keep track of all log file command length. Key is term, value is command length
-    log_lengths: HashMap<usize, usize>,
-
-    /// current term (log file id), start with 1 and continue growing
-    current_log_len: usize,
+    log_lengths: HashMap<usize, LengthCount>,
 
     /// keep track the current writing log file command length
+    current_log_len: usize,
+
+    /// keep track of the current dir for saving log files
     log_path: PathBuf,
 }
 
@@ -46,6 +48,56 @@ struct ValueIndex {
 }
 
 /// A store that keeps key-value pairs in memory
+///
+/// When storing the values related to those keys, file positions/offsets are saved as values in an
+/// index map in memory.
+///
+/// For example:
+/// ```
+/// (set k1, v1) -> (0, 33)
+/// (set k2, v2) -> (33, 66)
+/// (rm k1)      -> (66, 89)
+/// (set k3, v3) -> (89, 122)
+/// ```
+///
+/// KvStore has a writer: CursorBufWriter, which has a filed `pos` is used for keep track of the
+/// current position/cursor of the end of the file.
+///
+/// After loading the above example, `writer.pos` will be set as 122.
+///
+/// When adding another (set k4, v4) key-value pair, the value (122, 155) is inserted into index map,
+/// which can be retrieved by k4. And `writer.pos` will be set as 155.
+///
+/// --------------------------------------------------------------------------------------------
+///
+/// ## Multi-log-file version notes:
+///
+/// Keep a value of term: u64 in KvStore to keep track of the current term (start with 1, continue to grow).
+/// Write commands into file under /path/kvs.store/1.log.
+/// And when the number of commands reach MAX_NUM_COMMAND_PER_FILE, increase term by 1, then start writing to
+/// /path/kvs.store/2.log
+///
+/// When storing the values related to those keys, file the term number and positions/offsets are saved as values.
+/// For example:
+/// ```
+/// (set k1, v1) -> (1, 0, 33)
+/// (set k2, v2) -> (1, 33, 66)
+/// (rm k1)      -> (1, 66, 89)
+/// (set k3, v3) -> (1, 89, 122)
+///
+/// (set k4, v4) -> (2, 0, 33)  # this writes into a new file
+/// ```
+/// We keep a number of readers in a readers map to keep a reader for each log file.
+/// We also keep the log file length for each log file in `log_lengths`
+///
+/// An example log file would look something like
+/// ```
+/// {"Set":{"key":"k1","value":"v1"}}{"Remove":{"key":"k1"}}{"Set":{"key":"k1","value":"v1"}}{"Set":{"key":"k2","value":"v2"}}
+/// ```
+///
+/// ## Examples:
+///
+/// This is am example how you can use this KvStore:
 /// ```rust
 /// # use kvs::KvStore;
 /// let mut store = KvStore::open("./");
@@ -60,57 +112,25 @@ impl KvStore {
     /// Create or scan a logfile and create a KvStore from it.
     ///
     /// The this open function will firstly scan through the log file which are concatenated with
-    /// multiple JSON elements. And for all the SET entity, store the key to the map; while for all
-    /// the REMOVE entity, remove the key from the map.
+    /// multiple JSON elements.
+    /// * And for all the SET command, store the key to the index map
+    /// * while for all the REMOVE command, remove the key from the index map
     ///
-    /// When storing the values related to those keys, file positions/offsets are saved as values.
-    /// For example:
-    /// ```
-    /// (set k1, v1) -> (0, 33)
-    /// (set k2, v2) -> (33, 66)
-    /// (rm k1)      -> (66, 89)
-    /// (set k3, v3) -> (89, 122)
-    /// ```
+    /// At the same time, log_lengths - a map keeps track of all log file command length is also
+    /// created in memory.
     ///
-    /// KvStore has a writer: CursorBufWriter, which has a filed `pos` is used for keep track of the
-    /// current position/cursor of the end of the file.
-    ///
-    /// After loading the above example, `writer.pos` will be set as 122.
-    ///
-    /// When adding another (set k4, v4) key-value pair, the value (122, 155) is inserted into index map,
-    /// which can be retrieved by k4. And `writer.pos` will be set as 155.
-    ///
-    /// --------------------------------------------------------------------------------------------
-    ///
-    /// ## Multi-log-file version notes:
-    ///
-    /// Keep a value of term: u64 in KvStore to keep track of the current term (start with 1, continue to grow).
-    /// Write commands into file under /path/kvs.store/1.log.
-    /// And when the number of commands reach MAX_NUM_COMMAND_PER_FILE, increase term by 1, then start writing to
-    /// /path/kvs.store/2.log
-    ///
-    /// When storing the values related to those keys, file the term number and positions/offsets are saved as values.
-    /// For example:
-    /// ```
-    /// (set k1, v1) -> (1, 0, 33)
-    /// (set k2, v2) -> (1, 33, 66)
-    /// (rm k1)      -> (1, 66, 89)
-    /// (set k3, v3) -> (1, 89, 122)
-    ///
-    /// (set k4, v4) -> (2, 0, 33)  # this writes into a new file
-    /// ```
-    /// We keep a number of readers in a readers map to keep a reader for each log file.
-    /// We also keep the log file length for each log file in `log_lengths`
+    /// Also a reader for each term file is created, and a writer is created for the last term file
+    /// to append on.
     ///
     pub fn open(path: impl Into<PathBuf>) -> R<KvStore> {
         let path = path.into();
         let log_path = path.join("kvs.store");
 
         // multi file
-        let mut map = BTreeMap::new();
+        let mut map: BTreeMap<String, ValueIndex> = BTreeMap::new();
         let mut term: usize;
         let mut readers: HashMap<usize, BufReader<File>> = HashMap::new();
-        let mut log_lengths: HashMap<usize, usize> = HashMap::new();
+        let mut log_lengths: HashMap<usize, LengthCount> = HashMap::new();
         let mut last_log_path: OsString = path.join("kvs.store/1").into_os_string();
         let mut current_log_len: usize = 0;
 
@@ -148,17 +168,49 @@ impl KvStore {
                 let mut head: usize = 0;
                 let mut tail: usize;
 
+                let mut current_log_len_count = LengthCount::new();
+
                 current_log_len = 0;
+
                 while let Some(command) = stream.next() {
                     tail = stream.byte_offset();
 
                     if let Ok(command) = command {
                         match command {
                             Command::Set { key, value: _ } => {
+
+                                // if the key already set before, then garbage exist
+                                if let Some(old_index) =  map.get(&key) {
+                                    if old_index.term == current_term { // garbage at current term
+                                        current_log_len_count.increase_len_with_garbage();
+                                    } else { // garbage at previous term
+                                        let old_log_len_count = log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
+                                        old_log_len_count.increase_garbage_len();
+                                        current_log_len_count.increase_len();
+                                    }
+                                } else { // a new set key
+                                    current_log_len_count.increase_len();
+                                }
+
                                 map.insert(key, ValueIndex { term: current_term, head, tail });
                                 current_log_len += 1;
                             }
                             Command::Remove { key } => {
+
+                                // if the key already set before (here should always be true), then garbage exist
+                                if let Some(old_index) =  map.get(&key) {
+                                    if old_index.term == current_term { // garbage at current term
+                                        current_log_len_count.increase_garbage_len(); // count the set command as garbage
+                                        current_log_len_count.increase_len_with_garbage(); // increase length and count the remove command is also garbage
+                                    } else { // garbage at previous term
+                                        let old_log_len_count = log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
+                                        old_log_len_count.increase_garbage_len();
+                                        current_log_len_count.increase_len_with_garbage();
+                                    }
+                                } else {
+                                    println!("Warning: on opening, a Remove command encounter but without any previous set. Neglect it and moving on.");
+                                }
+
                                 map.remove(key.as_str());
                                 current_log_len += 1;
                             }
@@ -171,7 +223,7 @@ impl KvStore {
                 // then open again and it save as a it as a value reader
                 let reader = BufReader::new(OpenOptions::new().read(true).open(&entry.path())?);
                 readers.insert(current_term, reader);
-                log_lengths.insert(current_term, current_log_len);
+                log_lengths.insert(current_term, current_log_len_count);
 
                 // prepare for next loop
                 term = current_term;
@@ -194,7 +246,7 @@ impl KvStore {
         if log_file_count == 0 {
             let reader = BufReader::new(OpenOptions::new().read(true).open(&last_log_path)?);
             readers.insert(term, reader);
-            log_lengths.insert(term, current_log_len);
+            log_lengths.insert(term, LengthCount::new());
         }
 
         Ok(KvStore {
@@ -224,7 +276,7 @@ impl KvStore {
             // then open again and it save as a it as a value reader
             let reader = BufReader::new(OpenOptions::new().read(true).open(&new_log_path)?);
             self.readers.insert(self.term, reader);
-            self.log_lengths.insert(self.term, 0);
+            self.log_lengths.insert(self.term, LengthCount::new());
             self.current_log_len = 0;
         }
 
@@ -232,11 +284,6 @@ impl KvStore {
     }
 
     /// Get value by a key from store
-    ///
-    /// An example log file would look something like
-    /// ```
-    /// {"Set":{"key":"k1","value":"v1"}}{"Remove":{"key":"k1"}}{"Set":{"key":"k1","value":"v1"}}{"Set":{"key":"k2","value":"v2"}}
-    /// ```
     pub fn get(&mut self, key: String) -> R<Option<String>> {
         let index = match self.map.get(&key) {
             Some(index) => index,
@@ -248,6 +295,9 @@ impl KvStore {
         let mut buf = vec![0u8; index.tail - index.head]; // https://stackoverflow.com/questions/30412521/how-to-read-a-specific-number-of-bytes-from-a-stream
         reader.read_exact(&mut buf)?;
         let command: Command = serde_json::from_slice(&buf)?;
+
+        // TODO: delete
+        // println!("log_lengths: {:?}", self.log_lengths);
 
         match command {
             Command::Set { key: _, value } => {
@@ -265,33 +315,69 @@ impl KvStore {
     /// * update current_log_len
     /// * update index map
     pub fn set(&mut self, key: String, value: String) -> R<()> {
-        let command = Command::set(key, value);
-
         // break file if reaching limit
         self.break_to_new_log_file()?;
 
+        let command = Command::set(key, value);
         let pos_current = self.writer.pos;
         serde_json::to_writer(&mut self.writer, &command)?;
         self.writer.flush()?;
-        *self.log_lengths.entry(self.term).or_insert(0) += 1;
+
+        let key = match command { // own String key again
+            Command::Set{ key, value: _} => key,
+            _ => unreachable!()
+        };
+
+        // increase log count
+        // if the key already set before, then garbage exist
+        let mut compaction_term: usize = 0;
+        if let Some(old_index) = self.map.get(&key) {
+            if old_index.term == self.term { // garbage at current term
+                let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
+                current_log_len_count.increase_len_with_garbage();
+            } else { // garbage at previous term
+                let old_log_len_count = self.log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
+                old_log_len_count.increase_garbage_len();
+
+                if old_log_len_count.garbage_rate() > COMPACTION_THRESHOLD {
+                    compaction_term = old_index.term;
+                }
+
+                let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
+                current_log_len_count.increase_len();
+            }
+        } else { // this is a new key
+            let current_log_len_count = self.log_lengths.entry(self.term).or_insert(LengthCount::new());
+            current_log_len_count.increase_len();
+        }
+
         self.current_log_len += 1;
 
-        match command {
-            Command::Set { key, value: _ } => {
-                self.map
-                    .insert(key, ValueIndex {
-                        term: self.term,
-                        head: pos_current as usize,
-                        tail: self.writer.pos as usize,
-                    });
-            }
-            _ => unreachable!(),
+        self.map
+            .insert(key, ValueIndex {
+                term: self.term,
+                head: pos_current as usize,
+                tail: self.writer.pos as usize,
+            });
+
+
+        // TODO: delete
+        // println!("log_lengths: {:?}", self.log_lengths);
+
+        if compaction_term > 0 {
+            self.compaction(compaction_term)?;
         }
 
         Ok(())
     }
 
     /// Remove key value from store
+    ///
+    /// Operation include:
+    /// * write command to file
+    /// * update log_lengths map
+    /// * update current_log_len
+    /// * update index map
     pub fn remove(&mut self, key: String) -> R<()> {
         // check key exit:
         if !self.map.contains_key(key.as_str()) {
@@ -302,19 +388,101 @@ impl KvStore {
         self.break_to_new_log_file()?;
 
         let command = Command::remove(key);
-
         serde_json::to_writer(&mut self.writer, &command)?;
         self.writer.flush()?;
+
+        let key = match command { // own String key again
+            Command::Remove{ key} => key,
+            _ => unreachable!()
+        };
+
         // increase log count
-        *self.log_lengths.entry(self.term).or_insert(0) += 1;
+        // if the key already set before (here should always be true), then garbage exist
+        let mut compaction_term: usize = 0;
+        if let Some(old_index) = self.map.get(&key) {
+            if old_index.term == self.term { // garbage at current term
+                let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
+                current_log_len_count.increase_garbage_len(); // count the set command as garbage
+                current_log_len_count.increase_len_with_garbage(); // increase length and count the remove command is also garbage
+            } else { // garbage at previous term
+                let old_log_len_count = self.log_lengths.get_mut(&old_index.term).expect("log_length has no term key");
+                old_log_len_count.increase_garbage_len();
+                if old_log_len_count.garbage_rate() > COMPACTION_THRESHOLD {
+                    compaction_term = old_index.term;
+                }
+                let current_log_len_count = self.log_lengths.get_mut(&self.term).expect("log_length has no term key");
+                current_log_len_count.increase_len_with_garbage();
+            }
+        } else {
+            unreachable!();
+        }
+
         self.current_log_len += 1;
 
-        match command {
-            Command::Remove { key } => {
-                self.map.remove(key.as_str());
-            }
-            _ => unreachable!(),
+        self.map.remove(key.as_str());
+
+
+        // TODO: delete
+        // println!("log_lengths: {:?}", self.log_lengths);
+
+        if compaction_term > 0 {
+            self.compaction(compaction_term)?;
         }
+
+        Ok(())
+    }
+
+    /// Compaction
+    ///
+    /// This function is called when we know a log file of certain term has it's
+    /// garbage rate is larger than the compaction threshold. We already calculated the
+    /// garbage rate when self.set(key, value) or self.remove(key) function is called,
+    /// specifically when we know the garbage is at a previous term (we know as we compare the
+    /// key's index's term is not the current term.)
+    ///
+    /// Compaction is done by going through the term file to compact, finding all the Set Command
+    /// that is still effective, then write these commands at the end of the current term file.
+    /// During the process we update the index map, remove and consume the reader of the compaction term,
+    /// update log_lengths map, then finally remove the term file.
+    ///
+    fn compaction(&mut self, term: usize) -> R<()> {
+        let mut reader = self.readers.remove(&term).expect("Get old reader failed");
+        reader.seek(SeekFrom::Start(0))?;
+
+        let mut temp_map: HashMap<String, String> = HashMap::new();
+
+        let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
+        while let Some(command) = stream.next() {
+            if let Ok(command) = command {
+                match command {
+                    Command::Set {key, value} => {
+                        if let Some(index) = self.map.get(&key) {
+                            if index.term == term { // meaning this key value pair is still valid and stored in this term
+                                temp_map.insert(key, value);
+                            }
+                        }
+                    },
+                    _ => (),
+                }
+            }
+        }
+
+        let effective_element_len = self.log_lengths.get(&term).unwrap().effective_len();
+        let temp_map_len = temp_map.len();
+        if effective_element_len != temp_map_len {
+            panic!(format!("Compaction bug: effective element number {} is different from temp_map len {}", effective_element_len, temp_map_len));
+        }
+
+        // TODO - delete
+        println!("Garbage collect on term: {}, writing {} previous active commands.", term, effective_element_len);
+
+        for (k, v) in temp_map.into_iter() {
+            self.map.remove(&k).expect("Compaction error - remove key from index map");
+            self.set(k, v)?;
+        }
+        self.log_lengths.remove(&term).expect("Compaction error - remove term from log_lengths");
+        // finally delete the file
+        remove_file(self.log_path.join(term.to_string()))?;
 
         Ok(())
     }
