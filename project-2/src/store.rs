@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::fs::{create_dir_all, File, OpenOptions};
+use std::fs::{create_dir_all, File, OpenOptions, DirEntry};
 use std::io;
 use std::io::{BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -101,7 +101,7 @@ impl KvStore {
 
         // multi file
         let mut map = BTreeMap::new();
-        let mut term: usize = 0;
+        let mut term: usize;
         let mut readers: HashMap<usize, BufReader<File>> = HashMap::new();
         let mut log_lengths: HashMap<usize, usize> = HashMap::new();
         let mut last_log_path: OsString = path.join("kvs.store/1").into_os_string();
@@ -113,16 +113,21 @@ impl KvStore {
 
         // check folder empty or not
         let contents: std::fs::ReadDir = log_path.read_dir().expect("read_dir call failed");
-        let len = contents.collect::<Vec<_>>().len(); // calculate the amount of items in the directory
-        if len != 0 {
+        let log_file_count = contents.collect::<Vec<_>>().len(); // calculate the amount of items in the directory
+        if log_file_count != 0 {
             // log file folder not empty, has log files
             term = 0; // set term as 0, to allow comparing with `current_term` below, which is term number read as log file name
 
-            for entry in log_path.read_dir().expect("read_dir call failed") {
+            // sort log files
+            let logs = log_path.read_dir().expect("read_dir call failed").into_iter()
+                .filter(|f| dir_entry_to_usize(f.as_ref().unwrap()).is_ok())
+                .sorted_by(|a, b| {
+                    let a = &dir_entry_to_usize(a.as_ref().unwrap()).expect("log file name is not int format");
+                    let b = &dir_entry_to_usize(b.as_ref().unwrap()).expect("log file name is not int format");
+                    Ord::cmp(a, b)
+                });
+            for entry in logs {
                 let entry = entry?;
-
-                // TODO delete
-                println!("open file: {:?}", &entry.path());
 
                 let current_term: usize = entry.file_name().into_string().expect("log file name into_string failed")
                     .parse().expect("log file name is not int format");
@@ -135,7 +140,7 @@ impl KvStore {
                 let file = BufReader::new(OpenOptions::new().read(true).open(&entry.path())?);
                 let mut stream = Deserializer::from_reader(file).into_iter::<Command>(); // https://docs.serde.rs/serde_json/de/struct.StreamDeserializer.html
                 let mut head: usize = 0;
-                let mut tail: usize = 0;
+                let mut tail: usize;
 
                 num_command = 0;
                 while let Some(command) = stream.next() {
@@ -167,17 +172,24 @@ impl KvStore {
                 last_log_path = entry.path().into_os_string();
             }
         } else {
-            // log file folder empty, don't setup reader then
+            // log file folder empty, do nothing but set term as init value 1
             term = 1;
         }
 
-        // create file if not exist, by creating a writer
-        let mut writer = CursorBufWriter::new(
+        // Create writer. Also create log file to write if not exist, by creating this writer
+        let writer = CursorBufWriter::new(
             OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&last_log_path)?,
         )?;
+
+        // Create reader again when no log files found, otherwise readers will already be created above.
+        if log_file_count == 0 {
+            let reader = BufReader::new(OpenOptions::new().read(true).open(&last_log_path)?);
+            readers.insert(term, reader);
+            log_lengths.insert(term, num_command);
+        }
 
         Ok(KvStore {
             map,
@@ -248,8 +260,7 @@ impl KvStore {
             None => return Ok(None),
         };
 
-        let mut reader = self.readers.get_mut(&index.term).expect("reader with term x not exist");
-
+        let reader = self.readers.get_mut(&index.term).expect(&format!("reader with term {} not exist", &index.term ));
         reader.seek(SeekFrom::Start(index.head as u64))?;
         let mut buf = vec![0u8; index.tail - index.head]; // https://stackoverflow.com/questions/30412521/how-to-read-a-specific-number-of-bytes-from-a-stream
         reader.read_exact(&mut buf)?;
@@ -290,6 +301,11 @@ impl KvStore {
 
         Ok(())
     }
+}
+
+fn dir_entry_to_usize(entry: &DirEntry) -> R<usize> {
+    entry.file_name().into_string().expect("log file name into_string failed")
+        .parse().map_err(KvsError::ParseIntError)
 }
 
 /// Struct representing a command

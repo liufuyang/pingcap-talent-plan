@@ -14,6 +14,9 @@ pub enum KvsError {
     /// no key error
     #[fail(display = "no key found error")]
     NoKeyError,
+    /// parse int error
+    #[fail(display = "parse int error")]
+    ParseIntError(#[cause] std::num::ParseIntError),
 }
 
 impl From<io::Error> for KvsError {
@@ -25,6 +28,12 @@ impl From<io::Error> for KvsError {
 impl From<serde_json::error::Error> for KvsError {
     fn from(err: serde_json::error::Error) -> KvsError {
         KvsError::Serde(err)
+    }
+}
+
+impl From<std::num::ParseIntError> for KvsError {
+    fn from(err: std::num::ParseIntError) -> KvsError {
+        KvsError::ParseIntError(err)
     }
 }
 
