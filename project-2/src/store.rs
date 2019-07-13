@@ -47,17 +47,37 @@ struct ValueIndex {
     tail: usize,
 }
 
-/// A store that keeps key-value pairs in memory
+/// # KvStore : A simple Log-structured key value store
 ///
-/// When storing the values related to those keys, file positions/offsets are saved as values in an
-/// index map in memory.
+/// ## Examples:
 ///
-/// For example:
+/// This is am example how you can use this KvStore:
+/// ```rust
+/// # use kvs::KvStore;
+/// let mut store = KvStore::open("./");
+///
+/// store.set("key1".to_owned(), "value1".to_owned());
+/// assert_eq!(store.get("key1".to_owned()), Some("value1".to_owned()));
+///
+/// store.remove("key1".to_owned());
+/// assert_eq!(store.get("key1".to_owned()), None);
 /// ```
-/// (set k1, v1) -> (0, 33)
-/// (set k2, v2) -> (33, 66)
-/// (rm k1)      -> (66, 89)
-/// (set k3, v3) -> (89, 122)
+///
+/// When storing the values related to those keys, the file positions/offsets are saved as values in an
+/// `index map` in memory.
+///
+/// For example, conceptually key and value positions are stored in memroy:
+/// ```
+/// (set k1, v1) -> k1: (0, 33)
+/// (set k2, v2) -> k2: (33, 66)
+/// (rm k1)      -> k3: (66, 89)
+/// (set k3, v3) -> k4: (89, 122)
+/// ```
+///
+/// Actual key value pairs (commands) are saved in file. For example,
+/// a log file would look something like:
+/// ```
+/// {"Set":{"key":"k1","value":"v1"}}{"Remove":{"key":"k1"}}{"Set":{"key":"k1","value":"v1"}}{"Set":{"key":"k2","value":"v2"}}
 /// ```
 ///
 /// KvStore has a writer: CursorBufWriter, which has a filed `pos` is used for keep track of the
@@ -80,34 +100,17 @@ struct ValueIndex {
 /// When storing the values related to those keys, file the term number and positions/offsets are saved as values.
 /// For example:
 /// ```
-/// (set k1, v1) -> (1, 0, 33)
-/// (set k2, v2) -> (1, 33, 66)
-/// (rm k1)      -> (1, 66, 89)
-/// (set k3, v3) -> (1, 89, 122)
+/// (set k1, v1) -> k1: (1, 0, 33)
+/// (set k2, v2) -> k2: (1, 33, 66)
+/// (rm k1)      -> k3: (1, 66, 89)
+/// (set k3, v3) -> k4: (1, 89, 122)
 ///
 /// (set k4, v4) -> (2, 0, 33)  # this writes into a new file
 /// ```
 /// We keep a number of readers in a readers map to keep a reader for each log file.
 /// We also keep the log file length for each log file in `log_lengths`
 ///
-/// An example log file would look something like
-/// ```
-/// {"Set":{"key":"k1","value":"v1"}}{"Remove":{"key":"k1"}}{"Set":{"key":"k1","value":"v1"}}{"Set":{"key":"k2","value":"v2"}}
-/// ```
 ///
-/// ## Examples:
-///
-/// This is am example how you can use this KvStore:
-/// ```rust
-/// # use kvs::KvStore;
-/// let mut store = KvStore::open("./");
-///
-/// store.set("key1".to_owned(), "value1".to_owned());
-/// assert_eq!(store.get("key1".to_owned()), Some("value1".to_owned()));
-///
-/// store.remove("key1".to_owned());
-/// assert_eq!(store.get("key1".to_owned()), None);
-/// ```
 impl KvStore {
     /// Create or scan a logfile and create a KvStore from it.
     ///
