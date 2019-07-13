@@ -433,6 +433,18 @@ impl KvStore {
     }
 
     /// Compaction
+    ///
+    /// This function is called when we know a log file of certain term has it's
+    /// garbage rate is larger than the compaction threshold. We already calculated the
+    /// garbage rate when self.set(key, value) or self.remove(key) function is called,
+    /// specifically when we know the garbage is at a previous term (we know as we compare the
+    /// key's index's term is not the current term.)
+    ///
+    /// Compaction is done by going through the term file to compact, finding all the Set Command
+    /// that is still effective, then write these commands at the end of the current term file.
+    /// During the process we update the index map, remove and consume the reader of the compaction term,
+    /// update log_lengths map, then finally remove the term file.
+    ///
     fn compaction(&mut self, term: usize) -> R<()> {
         let mut reader = self.readers.remove(&term).expect("Get old reader failed");
         reader.seek(SeekFrom::Start(0))?;
