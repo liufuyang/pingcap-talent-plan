@@ -41,9 +41,9 @@ fn main() -> Result<()> {
             let mut store = KvStore::open("./")?;
 
             match store.remove(key.to_owned()) {
-                Err(KvsError::NoKeyError) => {
+                Err(KvsError::NO_KEY_ERROR) => {
                     println!("Key not found");
-                    Err(KvsError::NoKeyError)
+                    Err(KvsError::NO_KEY_ERROR)
                 }
                 _ => Ok(()),
             }

@@ -12,8 +12,8 @@ pub enum KvsError {
     #[fail(display = "{}", _0)]
     Serde(#[cause] serde_json::Error),
     /// no key error
-    #[fail(display = "no key found error")]
-    NoKeyError,
+    #[fail(display = "NO_KEY_ERROR")]
+    NO_KEY_ERROR,
 }
 
 impl From<io::Error> for KvsError {
